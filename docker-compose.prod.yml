@@ -1,0 +1,201 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: nppms-postgres-prod
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: nppms
+      POSTGRES_USER: nppms_user
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-nppms_password_prod}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data_prod:/var/lib/postgresql/data
+      - ./database_schema.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - nppms-network-prod
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nppms_user"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis for caching and queues
+  redis:
+    image: redis:7-alpine
+    container_name: nppms-redis-prod
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data_prod:/data
+    networks:
+      - nppms-network-prod
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Meilisearch for full-text search
+  meilisearch:
+    image: getmeili/meilisearch:v1.5
+    container_name: nppms-meilisearch-prod
+    restart: unless-stopped
+    environment:
+      MEILI_MASTER_KEY: ${MEILISEARCH_KEY:-nppms_search_key_prod}
+      MEILI_ENV: production
+    ports:
+      - "7700:7700"
+    volumes:
+      - meilisearch_data_prod:/meili_data
+    networks:
+      - nppms-network-prod
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7700/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # MinIO for object storage (S3 compatible)
+  minio:
+    image: minio/minio:latest
+    container_name: nppms-minio-prod
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-nppms_minio_prod}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-nppms_minio_password_prod}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data_prod:/data
+    networks:
+      - nppms-network-prod
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Laravel Backend (Production)
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: production
+    container_name: nppms-backend-prod
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      meilisearch:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      DB_CONNECTION: pgsql
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_DATABASE: nppms
+      DB_USERNAME: nppms_user
+      DB_PASSWORD: ${DB_PASSWORD:-nppms_password_prod}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      MEILISEARCH_HOST: http://meilisearch:7700
+      MEILISEARCH_KEY: ${MEILISEARCH_KEY:-nppms_search_key_prod}
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-nppms_minio_prod}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-nppms_minio_password_prod}
+      MINIO_BUCKET: nppms-documents
+      APP_URL: ${APP_URL:-http://localhost}
+      APP_ENV: production
+      APP_DEBUG: "false"
+      APP_KEY: ${APP_KEY:-base64:random32charstringhereforproduction}
+      LOG_CHANNEL: stack
+      LOG_LEVEL: info
+      MAIL_MAILER: smtp
+      MAIL_HOST: ${MAIL_HOST:-smtp.mailtrap.io}
+      MAIL_PORT: ${MAIL_PORT:-2525}
+      MAIL_USERNAME: ${MAIL_USERNAME}
+      MAIL_PASSWORD: ${MAIL_PASSWORD}
+      MAIL_ENCRYPTION: ${MAIL_ENCRYPTION:-tls}
+      MAIL_FROM_ADDRESS: ${MAIL_FROM_ADDRESS:-noreply@nppms.local}
+      MAIL_FROM_NAME: ${MAIL_FROM_NAME:-NPPMS}
+    ports:
+      - "8000:8000"
+    volumes:
+      - backend_storage_prod:/var/www/html/storage
+      - backend_logs_prod:/var/www/html/storage/logs
+    networks:
+      - nppms-network-prod
+    working_dir: /var/www/html
+    command: >
+      sh -c "
+      php artisan migrate --force &&
+      php artisan db:seed --force &&
+      php artisan optimize &&
+      php artisan serve --host=0.0.0.0 --port=8000"
+
+  # Next.js Frontend (Production)
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: runner
+    container_name: nppms-frontend-prod
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://backend:8000/api}
+      NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL:-http://localhost}
+      NODE_ENV: production
+    ports:
+      - "3000:3000"
+    networks:
+      - nppms-network-prod
+    working_dir: /app
+
+  # Nginx Reverse Proxy with SSL
+  nginx:
+    image: nginx:alpine
+    container_name: nppms-nginx-prod
+    restart: unless-stopped
+    depends_on:
+      - backend
+      - frontend
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.prod.conf:/etc/nginx/nginx.conf
+      - ./nginx/ssl:/etc/nginx/ssl
+      - ./nginx/logs:/var/log/nginx
+    networks:
+      - nppms-network-prod
+
+volumes:
+  postgres_data_prod:
+    driver: local
+  redis_data_prod:
+    driver: local
+  meilisearch_data_prod:
+    driver: local
+  minio_data_prod:
+    driver: local
+  backend_storage_prod:
+    driver: local
+  backend_logs_prod:
+    driver: local
+
+networks:
+  nppms-network-prod:
+    driver: bridge

@@ -1,0 +1,203 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: nppms-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: nppms
+      POSTGRES_USER: nppms_user
+      POSTGRES_PASSWORD: nppms_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database_schema.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - nppms-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nppms_user"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis for caching and queues
+  redis:
+    image: redis:7-alpine
+    container_name: nppms-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - nppms-network
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Meilisearch for full-text search
+  meilisearch:
+    image: getmeili/meilisearch:v1.5
+    container_name: nppms-meilisearch
+    restart: unless-stopped
+    environment:
+      MEILI_MASTER_KEY: nppms_search_key
+      MEILI_ENV: development
+    ports:
+      - "7700:7700"
+    volumes:
+      - meilisearch_data:/meili_data
+    networks:
+      - nppms-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7700/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # MinIO for object storage (S3 compatible)
+  minio:
+    image: minio/minio:latest
+    container_name: nppms-minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: nppms_minio
+      MINIO_ROOT_PASSWORD: nppms_minio_password
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - nppms-network
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Laravel Backend
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: nppms-backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      meilisearch:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      DB_CONNECTION: pgsql
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_DATABASE: nppms
+      DB_USERNAME: nppms_user
+      DB_PASSWORD: nppms_password
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      MEILISEARCH_HOST: http://meilisearch:7700
+      MEILISEARCH_KEY: nppms_search_key
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: nppms_minio
+      MINIO_SECRET_KEY: nppms_minio_password
+      MINIO_BUCKET: nppms-documents
+      APP_URL: http://localhost:8000
+      APP_ENV: local
+      APP_DEBUG: "true"
+      APP_KEY: base64:${APP_KEY:-random32charstringhereforlocaldevelopment}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/var/www/html
+      - backend_storage:/var/www/html/storage
+      - backend_vendor:/var/www/html/vendor
+    networks:
+      - nppms-network
+    working_dir: /var/www/html
+    command: >
+      sh -c "
+      php artisan migrate --force &&
+      php artisan db:seed --force &&
+      php artisan serve --host=0.0.0.0 --port=8000"
+
+  # Next.js Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: nppms-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      NEXT_PUBLIC_API_URL: http://backend:8000/api
+      NEXT_PUBLIC_APP_URL: http://localhost:3000
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    networks:
+      - nppms-network
+    working_dir: /app
+    command: npm run dev
+
+  # Nginx Reverse Proxy (Optional)
+  nginx:
+    image: nginx:alpine
+    container_name: nppms-nginx
+    restart: unless-stopped
+    depends_on:
+      - backend
+      - frontend
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/ssl:/etc/nginx/ssl
+    networks:
+      - nppms-network
+
+  # MailHog for email testing
+  mailhog:
+    image: mailhog/mailhog:latest
+    container_name: nppms-mailhog
+    restart: unless-stopped
+    ports:
+      - "8025:8025" # Web UI
+      - "1025:1025" # SMTP server
+    networks:
+      - nppms-network
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  meilisearch_data:
+    driver: local
+  minio_data:
+    driver: local
+  backend_storage:
+    driver: local
+  backend_vendor:
+    driver: local
+
+networks:
+  nppms-network:
+    driver: bridge
