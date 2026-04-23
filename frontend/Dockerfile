@@ -7,14 +7,17 @@ WORKDIR /app
 # Copy package files
 COPY package*.json ./
 
-# Install dependencies
-RUN npm ci --only=production
+# Install dependencies (including dev dependencies for build)
+RUN npm ci
+
+# Install sharp for image optimization
+RUN npm install sharp
 
 # Copy all files
 COPY . .
 
-# Build the application
-RUN npm run build
+# Build the application with webpack (avoid Turbopack issues)
+RUN npm run build -- --webpack
 
 # Production stage
 FROM node:18-alpine AS runner
